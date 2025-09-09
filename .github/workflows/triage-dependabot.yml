@@ -48,93 +48,89 @@ jobs:
             echo "-> Java detected (light heuristics, no build)"
           fi
 
+      - name: Ensure jq is available
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
       - name: Fetch Dependabot alerts (REST mit GraphQL-Fallback)
         shell: bash
         env:
-            REPO: ${{ inputs.repo }}
+          REPO: ${{ inputs.repo }}
         run: |
-            set -euo pipefail
-            mkdir -p triage
-
-            echo "== Versuch 1: REST /dependabot/alerts"
-            set +e
-            gh api \
+          set -euo pipefail
+          mkdir -p triage
+          echo "== Versuch 1: REST /dependabot/alerts"
+          set +e
+          gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             --paginate \
             "/repos/${REPO}/dependabot/alerts?per_page=100&state=open" \
             > triage/alerts.json 2> triage/alerts.err
-            rc=$?
-            set -e
-
-            if [ $rc -ne 0 ] || [ ! -s triage/alerts.json ]; then
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ] || [ ! -s triage/alerts.json ]; then
             echo "REST fehlgeschlagen (rc=$rc) oder leer. STDERR:"
             cat triage/alerts.err || true
             echo "== Versuch 2: GraphQL vulnerabilityAlerts (Fallback)"
-            # GraphQL: holt die gleichen Alerts (früher „Security/Vulnerability Alerts“)
-            # Wir mappen direkt auf ein REST-ähnliches Format für den weiteren Code.
             Q='
             query($owner:String!,$name:String!,$after:String){
-                repository(owner:$owner,name:$name){
+              repository(owner:$owner,name:$name){
                 vulnerabilityAlerts(first:100, after:$after){
-                    pageInfo{ hasNextPage endCursor }
-                    nodes{
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{
                     id
                     vulnerableManifestPath
                     securityVulnerability{
-                        package{ name ecosystem }
-                        advisory{ ghsaId summary identifiers{ type value } }
-                        severity
-                        vulnerableVersionRange
+                      package{ name ecosystem }
+                      advisory{ ghsaId summary identifiers{ type value } }
+                      severity
+                      vulnerableVersionRange
                     }
-                    }
+                  }
                 }
-                }
+              }
             }'
             OWNER="${REPO%%/*}"
             NAME="${REPO##*/}"
             echo "[]" > triage/_alerts.tmp.json
             AFTER="null"
             while : ; do
-                RESP=$(gh api graphql -f query="$Q" -F owner="$OWNER" -F name="$NAME" -F after="$AFTER")
-                # Seite zu JSON-Liste ausrollen
-                echo "$RESP" | jq -c '.data.repository.vulnerabilityAlerts.nodes
+              RESP=$(gh api graphql -f query="$Q" -F owner="$OWNER" -F name="$NAME" -F after="$AFTER")
+              echo "$RESP" | jq -c '.data.repository.vulnerabilityAlerts.nodes
                 | map({
                     dependency: {
-                        package: {
-                        name: (.securityVulnerability.package.name // ""),
-                        ecosystem: (.securityVulnerability.package.ecosystem // "")
-                        },
-                        manifest_path: (.vulnerableManifestPath // "")
+                      package: { name: (.securityVulnerability.package.name // ""), ecosystem: (.securityVulnerability.package.ecosystem // "") },
+                      manifest_path: (.vulnerableManifestPath // "")
                     },
                     security_advisory: {
-                        ghsa_id: (.securityVulnerability.advisory.ghsaId // ""),
-                        identifiers: (.securityVulnerability.advisory.identifiers // []),
-                        severity: (.securityVulnerability.severity // "")
+                      ghsa_id: (.securityVulnerability.advisory.ghsaId // ""),
+                      identifiers: (.securityVulnerability.advisory.identifiers // []),
+                      severity: (.securityVulnerability.severity // "")
                     },
                     security_vulnerability: {
-                        severity: (.securityVulnerability.severity // ""),
-                        vulnerable_version_range: (.securityVulnerability.vulnerableVersionRange // ""),
-                        advisory: {
+                      severity: (.securityVulnerability.severity // ""),
+                      vulnerable_version_range: (.securityVulnerability.vulnerableVersionRange // ""),
+                      advisory: {
                         ghsa_id: (.securityVulnerability.advisory.ghsaId // ""),
                         cve_id: ((.securityVulnerability.advisory.identifiers[]? | select(.type==\"CVE\") | .value) // null),
                         summary: (.securityVulnerability.advisory.summary // "")
-                        }
+                      }
                     },
                     html_url: null,
                     state: "open"
-                    })' > triage/_page.json
-                jq -s '.[0] + .[1]' triage/_alerts.tmp.json triage/_page.json > triage/_alerts.merge.json
-                mv triage/_alerts.merge.json triage/_alerts.tmp.json
-                HAS_NEXT=$(echo "$RESP" | jq '.data.repository.vulnerabilityAlerts.pageInfo.hasNextPage')
-                if [ "$HAS_NEXT" != "true" ]; then break; fi
-                AFTER=$(echo "$RESP" | jq -r '.data.repository.vulnerabilityAlerts.pageInfo.endCursor' | jq -R .)
+                  })' > triage/_page.json
+              jq -s '.[0] + .[1]' triage/_alerts.tmp.json triage/_page.json > triage/_alerts.merge.json
+              mv triage/_alerts.merge.json triage/_alerts.tmp.json
+              HAS_NEXT=$(echo "$RESP" | jq '.data.repository.vulnerabilityAlerts.pageInfo.hasNextPage')
+              [ "$HAS_NEXT" = "true" ] || break
+              AFTER=$(echo "$RESP" | jq -r '.data.repository.vulnerabilityAlerts.pageInfo.endCursor' | jq -R .)
             done
             mv triage/_alerts.tmp.json triage/alerts.json || echo "[]" > triage/alerts.json
-            fi
+          fi
 
-            echo "ALERT COUNT: $(jq 'length' triage/alerts.json)"
-
+          echo "ALERT COUNT: $(jq 'length' triage/alerts.json)"
 
       - name: Classify alerts (used/dev/dedupe incl. Java light)
         shell: bash
@@ -303,7 +299,6 @@ jobs:
               labels = ["security","dependabot","needs-triage"]
               labels.append("dev" if scope=="dev" else "runtime")
 
-              # dedupe by title
               lst = sh("gh","issue","list","-R",dest,"--search",title,"--json","number,title")
               try:
                   existing = [i["title"] for i in json.loads(lst.stdout or "[]")]
