@@ -1,4 +1,4 @@
-name: Reusable - Dependabot Auto-Triage
+name: Reusable – Dependabot Auto-Triage
 
 on:
   workflow_call:
@@ -16,69 +16,63 @@ jobs:
       security-events: read
       issues: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ inputs.repo }}
+      GH_TOKEN: ${{ github.token }}   # für gh api
 
     steps:
       - name: Checkout target repo
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.REPO }}
+          repository: ${{ inputs.repo }}
           fetch-depth: 0
 
-      - name: Install scanners (only if needed, recursive)
-        shell: bash
+      - name: Install scanners (nur wenn nötig, rekursiv)
         run: |
-          set -euo pipefail
           if find . -name package.json | grep -q .; then
-            echo "-> JS/TS detected, installing depcheck"
+            echo "-> JS/TS erkannt, installiere depcheck"
             sudo npm i -g depcheck
           fi
           if find . -name requirements.txt -o -name pyproject.toml | grep -q .; then
-            echo "-> Python detected, installing vulture + pip-check-unused"
+            echo "-> Python erkannt, installiere vulture + pip-check-unused"
             python -m pip install --upgrade pip
             python -m pip install vulture pip-check-unused
           fi
           if find . -name composer.json | grep -q .; then
-            echo "-> PHP detected, installing composer (composer-unused optional)"
+            echo "-> PHP erkannt, installiere composer (optional: composer-unused)"
             sudo apt-get update -y && sudo apt-get install -y composer
             composer global require composer-unused/composer-unused --no-interaction || true
           fi
           if find . -name pom.xml -o -name build.gradle -o -name build.gradle.kts | grep -q .; then
-            echo "-> Java detected (light heuristics, no build)"
+            echo "-> Java erkannt (Maven/Gradle) – light Heuristik, kein Build"
           fi
 
-      - name: Fetch Dependabot alerts (robust)
-        shell: bash
+      - name: Fetch Dependabot alerts (no dismiss, 404-freundlich)
         run: |
-          set -euo pipefail
           mkdir -p triage
           set +e
           gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
-                 repos/${REPO}/dependabot/alerts -F per_page=100 --paginate \
+                 repos/${{ inputs.repo }}/dependabot/alerts -F per_page=100 --paginate \
                  > triage/alerts.json 2> triage/alerts.err
           rc=$?
           set -e
           if [ $rc -ne 0 ]; then
-            echo "Fetch stderr:"
-            cat triage/alerts.err || true
             if grep -qi "Not Found" triage/alerts.err; then
-              echo "::warning::Dependabot alerts API 404 for ${REPO}. Continuing with empty list."
+              echo "::warning::Dependabot alerts API 404 für ${{ inputs.repo }} – vermutlich nicht aktiviert. Fahre mit leerer Liste fort."
               echo "[]" > triage/alerts.json
             else
+              echo "Fehler beim Abrufen der Alerts:"; cat triage/alerts.err || true
               exit $rc
             fi
           fi
 
-      - name: Classify alerts (used/dev/dedupe incl. Java light)
+      - name: Classify alerts (used/dev/dedupe inkl. Java light)
         shell: bash
         run: |
-          set -euo pipefail
-          python << 'PY'
+          python <<'PY'
           import os, json, subprocess, re, pathlib
 
           alerts = json.load(open("triage/alerts.json","r",encoding="utf-8"))
 
+          # Spracherkennung (nur für Heuristiken)
           p = pathlib.Path(".")
           langs=set()
           if any(p.glob("**/package.json")): langs |= {"javascript","typescript"}
@@ -86,6 +80,7 @@ jobs:
           if any(p.glob("**/composer.json")): langs |= {"php"}
           if any(p.glob("**/pom.xml")) or any(p.glob("**/build.gradle*")): langs |= {"java"}
 
+          # JS/TS: depcheck (falls vorhanden)
           used_node=set()
           try:
               out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
@@ -97,7 +92,10 @@ jobs:
           except Exception:
               pass
 
+          # --- naive Used-Scans pro Sprache ---
           def naive_used(pkg:str, eco:str)->bool:
+              """Einfache Import-/Use-Muster in Code-Dateien.
+                 Für Maven ist pkg oft 'groupId:artifactId' → splitten."""
               exts = (".js",".jsx",".ts",".tsx",".py",".php",".java",".kt",".kts",".rb")
               pats = [
                   rf"require\(['\"]{re.escape(pkg)}['\"]\)",
@@ -131,6 +129,7 @@ jobs:
           def sev_rank(s): 
               return {"critical":4,"high":3,"moderate":2,"medium":2,"low":1}.get((s or "").lower(),0)
 
+          # Dedupe per (ecosystem, package, cve/ghsa)
           best={}
           for a in alerts:
               dep = a.get("dependency") or {}
@@ -161,6 +160,7 @@ jobs:
               manifest = dep.get("manifest_path") or ""
               url = a.get("html_url") or ""
 
+              # Scope (dev?) – sicher für npm/pip; Java/PHP konservativ
               dev=False
               if eco in ("npm","pnpm","yarn") and manifest.endswith("package.json"):
                   try:
@@ -171,11 +171,13 @@ jobs:
                       pass
               if eco in ("pip","pypi") and ("dev" in manifest.lower() or "test" in manifest.lower()):
                   dev=True
+              # Java light: wenn Pfad Hinweise auf tests hat → dev
               if eco in ("maven","gradle","github-actions-gradle","github-actions-maven"):
                   mp = manifest.lower()
                   if "test" in mp or "/tests/" in mp or "\\tests\\" in mp:
                       dev=True
 
+              # Used?
               used=False
               if eco in ("npm","pnpm","yarn") and pkg in used_node:
                   used=True
@@ -206,16 +208,15 @@ jobs:
           json.dump(ignored, open("triage/ignored.json","w",encoding="utf-8"), indent=2, ensure_ascii=False)
           PY
 
-      - name: Mirror kept alerts to Issues (no dismiss)
+      - name: Mirror kept alerts to Issues (labelbar, ohne Dismiss)
         env:
-          DEST_REPO: ${{ env.REPO }}   # ändere hier auf zentrales Repo, falls Issues im Zielrepo aus sind
+          REPO: ${{ inputs.repo }}
         shell: bash
         run: |
-          set -euo pipefail
-          python << 'PY'
+          python - <<'PY'
           import json, os, subprocess
 
-          dest = os.environ.get("DEST_REPO","")
+          repo = os.environ["REPO"]
           kept = json.load(open("triage/kept.json","r",encoding="utf-8"))
 
           def sh(*args):
@@ -226,7 +227,7 @@ jobs:
               scope = "dev" if r.get("dev")=="yes" else "runtime/unknown"
               body = (
                   "Automatische Triage – Alert bleibt offen (kein Dismiss).\n\n"
-                  f"- **Repo**: {dest}\n"
+                  f"- **Repo**: {repo}\n"
                   f"- **Paket**: `{r.get('package','')}` ({r.get('ecosystem','')})\n"
                   f"- **Severity**: {r.get('severity','')}\n"
                   f"- **Scope**: {scope}\n"
@@ -237,25 +238,17 @@ jobs:
               labels = ["security","dependabot","needs-triage"]
               labels.append("dev" if scope=="dev" else "runtime")
 
-              # dedupe by title
-              lst = sh("gh","issue","list","-R",dest,"--search",title,"--json","number,title")
+              lst = sh("gh","issue","list","-R",repo,"--search",title,"--json","number,title")
               try:
                   existing = [i["title"] for i in json.loads(lst.stdout or "[]")]
               except Exception:
                   existing = []
               if title not in existing:
-                  sh("gh","issue","create","-R",dest,"--title",title,"--body",body,"--label",",".join(labels))
+                  sh("gh","issue","create","-R",repo,"--title",title,"--body",body,"--label",",".join(labels))
           PY
-
-      - name: Sanitize artifact name
-        id: sanitize
-        shell: bash
-        run: |
-          SAFE_NAME="$(echo "${REPO}" | tr '/' '-')"
-          echo "safe=${SAFE_NAME}" >> $GITHUB_OUTPUT
 
       - name: Upload triage artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: triage-${{ steps.sanitize.outputs.safe }}
+          name: triage-${{ inputs.repo }}
           path: triage/**
