@@ -48,89 +48,112 @@ jobs:
             echo "-> Java detected (light heuristics, no build)"
           fi
 
-      - name: Ensure jq is available
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Fetch Dependabot alerts (REST mit GraphQL-Fallback)
-        shell: bash
+      - name: Fetch Dependabot alerts (REST + GraphQL Fallback, Python)
         env:
-          REPO: ${{ inputs.repo }}
+            REPO: ${{ inputs.repo }}
+        shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p triage
-          echo "== Versuch 1: REST /dependabot/alerts"
-          set +e
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            --paginate \
-            "/repos/${REPO}/dependabot/alerts?per_page=100&state=open" \
-            > triage/alerts.json 2> triage/alerts.err
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ] || [ ! -s triage/alerts.json ]; then
-            echo "REST fehlgeschlagen (rc=$rc) oder leer. STDERR:"
-            cat triage/alerts.err || true
-            echo "== Versuch 2: GraphQL vulnerabilityAlerts (Fallback)"
-            Q='
+            set -euo pipefail
+            mkdir -p triage
+
+            python << 'PY'
+            import json, os, subprocess, sys
+
+            REPO = os.environ["REPO"]
+
+            def sh(*args):
+            return subprocess.run(args, capture_output=True, text=True)
+
+            # 1) REST versuchen
+            rest = sh(
+            "gh","api",
+            "-H","Accept: application/vnd.github+json",
+            "-H","X-GitHub-Api-Version: 2022-11-28",
+            f"/repos/{REPO}/dependabot/alerts",
+            "-F","per_page=100","--paginate"
+            )
+            alerts = []
+            if rest.returncode == 0 and rest.stdout.strip():
+            try:
+                alerts = json.loads(rest.stdout)
+            except Exception:
+                alerts = []
+
+            # 2) GraphQL Fallback wenn REST nicht geht
+            if not alerts:
+            q = """
             query($owner:String!,$name:String!,$after:String){
-              repository(owner:$owner,name:$name){
+                repository(owner:$owner,name:$name){
                 vulnerabilityAlerts(first:100, after:$after){
-                  pageInfo{ hasNextPage endCursor }
-                  nodes{
-                    id
+                    pageInfo{ hasNextPage endCursor }
+                    nodes{
                     vulnerableManifestPath
                     securityVulnerability{
-                      package{ name ecosystem }
-                      advisory{ ghsaId summary identifiers{ type value } }
-                      severity
-                      vulnerableVersionRange
+                        package{ name ecosystem }
+                        advisory{ ghsaId summary identifiers{ type value } }
+                        severity
+                        vulnerableVersionRange
                     }
-                  }
+                    }
                 }
-              }
-            }'
-            OWNER="${REPO%%/*}"
-            NAME="${REPO##*/}"
-            echo "[]" > triage/_alerts.tmp.json
-            AFTER="null"
-            while : ; do
-              RESP=$(gh api graphql -f query="$Q" -F owner="$OWNER" -F name="$NAME" -F after="$AFTER")
-              echo "$RESP" | jq -c '.data.repository.vulnerabilityAlerts.nodes
-                | map({
-                    dependency: {
-                      package: { name: (.securityVulnerability.package.name // ""), ecosystem: (.securityVulnerability.package.ecosystem // "") },
-                      manifest_path: (.vulnerableManifestPath // "")
+                }
+            }"""
+            owner, name = REPO.split("/",1)
+            after = "null"
+            out = []
+            while True:
+                resp = sh("gh","api","graphql","-f",f"query={q}",
+                        "-F",f"owner={owner}",
+                        "-F",f"name={name}",
+                        "-F",f"after={after}")
+                if resp.returncode != 0:
+                break
+                try:
+                data = json.loads(resp.stdout)
+                nodes = (((data or {}).get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("nodes",[])
+                except Exception:
+                nodes = []
+                for n in nodes:
+                sv = (n.get("securityVulnerability") or {})
+                pkg = (sv.get("package") or {})
+                adv = (sv.get("advisory") or {})
+                # baue REST-ähnliche Struktur
+                alerts.append({
+                    "dependency": {
+                    "package": {
+                        "name": pkg.get("name") or "",
+                        "ecosystem": (pkg.get("ecosystem") or "").lower()
                     },
-                    security_advisory: {
-                      ghsa_id: (.securityVulnerability.advisory.ghsaId // ""),
-                      identifiers: (.securityVulnerability.advisory.identifiers // []),
-                      severity: (.securityVulnerability.severity // "")
+                    "manifest_path": n.get("vulnerableManifestPath") or ""
                     },
-                    security_vulnerability: {
-                      severity: (.securityVulnerability.severity // ""),
-                      vulnerable_version_range: (.securityVulnerability.vulnerableVersionRange // ""),
-                      advisory: {
-                        ghsa_id: (.securityVulnerability.advisory.ghsaId // ""),
-                        cve_id: ((.securityVulnerability.advisory.identifiers[]? | select(.type==\"CVE\") | .value) // null),
-                        summary: (.securityVulnerability.advisory.summary // "")
-                      }
+                    "security_advisory": {
+                    "ghsa_id": adv.get("ghsaId") or "",
+                    "identifiers": adv.get("identifiers") or [],
+                    "severity": sv.get("severity") or ""
                     },
-                    html_url: null,
-                    state: "open"
-                  })' > triage/_page.json
-              jq -s '.[0] + .[1]' triage/_alerts.tmp.json triage/_page.json > triage/_alerts.merge.json
-              mv triage/_alerts.merge.json triage/_alerts.tmp.json
-              HAS_NEXT=$(echo "$RESP" | jq '.data.repository.vulnerabilityAlerts.pageInfo.hasNextPage')
-              [ "$HAS_NEXT" = "true" ] || break
-              AFTER=$(echo "$RESP" | jq -r '.data.repository.vulnerabilityAlerts.pageInfo.endCursor' | jq -R .)
-            done
-            mv triage/_alerts.tmp.json triage/alerts.json || echo "[]" > triage/alerts.json
-          fi
+                    "security_vulnerability": {
+                    "severity": sv.get("severity") or "",
+                    "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
+                    "advisory": {
+                        "ghsa_id": adv.get("ghsaId") or "",
+                        "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
+                        "summary": adv.get("summary") or ""
+                    }
+                    },
+                    "html_url": None,
+                    "state": "open"
+                })
+                page = (((data or {}).get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("pageInfo",{})
+                if not page.get("hasNextPage"):
+                break
+                # GraphQL cursor muss als JSON-String weitergereicht werden
+                after = json.dumps(page.get("endCursor"))
 
-          echo "ALERT COUNT: $(jq 'length' triage/alerts.json)"
+            with open("triage/alerts.json","w",encoding="utf-8") as f:
+            json.dump(alerts, f)
+            print(f"Fetched alerts: {len(alerts)}")
+            PY
+
 
       - name: Classify alerts (used/dev/dedupe incl. Java light)
         shell: bash
