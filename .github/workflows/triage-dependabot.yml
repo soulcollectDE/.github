@@ -7,11 +7,12 @@ on:
         required: true
         type: string
     secrets:
-      security_token:        # optionaler PAT-Fallback
+      security_token:        # optionaler PAT-Fallback (z.B. secrets.SECURITY_READ_TOKEN)
         required: false
 
 jobs:
   triage:
+    name: Triage ${{ inputs.repo }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,129 +53,127 @@ jobs:
 
       - name: Who am I & can I see the repo?
         run: |
-            gh auth status
-            gh api -i repos/${{ env.REPO }} | head -n 20
-
+          gh auth status
+          gh api -i repos/${{ env.REPO }} | head -n 20 || true
 
       - name: Fetch Dependabot alerts (open → all → GraphQL)
         env:
-            REPO: ${{ inputs.repo }}
+          REPO: ${{ inputs.repo }}
         shell: bash
         run: |
-            set -euo pipefail
-            mkdir -p triage
+          set -euo pipefail
+          mkdir -p triage
 
-            python << 'PY'
-            import json, os, subprocess, sys
+          python << 'PY'
+          import json, os, subprocess
 
-            REPO = os.environ["REPO"]
+          REPO = os.environ["REPO"]
 
-            def sh(*args):
-                return subprocess.run(args, capture_output=True, text=True)
+          def sh(*args):
+              return subprocess.run(args, capture_output=True, text=True)
 
-            def try_rest(state):
-                print(f"REST try state={state} …")
-                r = sh(
-                    "gh","api",
-                    "-H","Accept: application/vnd.github+json",
-                    "-H","X-GitHub-Api-Version: 2022-11-28",
-                    f"repos/{REPO}/dependabot/alerts?state={state}&per_page=100",
-                    "--paginate"
-                )
-                if r.returncode != 0:
-                    print(f"REST {state} rc={r.returncode}: {r.stderr.strip()}")
-                    return []
-                try:
-                    arr = json.loads(r.stdout or "[]")
-                except Exception:
-                    arr = []
-                print(f"REST {state} count={len(arr)}")
-                return arr
+          def try_rest(state):
+              print(f"REST try state={state} …")
+              r = sh(
+                  "gh","api",
+                  "-H","Accept: application/vnd.github+json",
+                  "-H","X-GitHub-Api-Version: 2022-11-28",
+                  f"repos/{REPO}/dependabot/alerts?state={state}&per_page=100",
+                  "--paginate"
+              )
+              if r.returncode != 0:
+                  print(f"REST {state} rc={r.returncode}: {r.stderr.strip()}")
+                  return []
+              try:
+                  arr = json.loads(r.stdout or "[]")
+              except Exception:
+                  arr = []
+              print(f"REST {state} count={len(arr)}")
+              return arr
 
-            def try_graphql():
-                print("GraphQL fallback …")
-                q = """
-                query($owner:String!,$name:String!,$after:String){
+          def try_graphql():
+              print("GraphQL fallback …")
+              q = """
+              query($owner:String!,$name:String!,$after:String){
                 repository(owner:$owner,name:$name){
-                    vulnerabilityAlerts(first:100, after:$after){
+                  vulnerabilityAlerts(first:100, after:$after){
                     pageInfo{ hasNextPage endCursor }
                     nodes{
-                        vulnerableManifestPath
-                        securityVulnerability{
+                      vulnerableManifestPath
+                      securityVulnerability{
                         package{ name ecosystem }
                         advisory{ ghsaId summary identifiers{ type value } }
                         severity
                         vulnerableVersionRange
-                        }
+                      }
                     }
-                    }
+                  }
                 }
-                }"""
-                owner, name = REPO.split("/",1)
-                after = "null"
-                out = []
-                while True:
-                    resp = sh("gh","api","graphql","-f",f"query={q}",
+              }"""
+              owner, name = REPO.split("/",1)
+              after = "null"
+              out = []
+              while True:
+                  resp = sh("gh","api","graphql","-f",f"query={q}",
                             "-F",f"owner={owner}",
                             "-F",f"name={name}",
                             "-F",f"after={after}")
-                    if resp.returncode != 0:
-                        print(f"GraphQL rc={resp.returncode}: {resp.stderr.strip()}")
-                        break
-                    try:
-                        data = json.loads(resp.stdout)
-                    except Exception:
-                        data = {}
-                    va = (((data.get("data") or {}).get("repository") or {})
+                  if resp.returncode != 0:
+                      print(f"GraphQL rc={resp.returncode}: {resp.stderr.strip()}")
+                      break
+                  try:
+                      data = json.loads(resp.stdout)
+                  except Exception:
+                      data = {}
+                  va = (((data.get("data") or {}).get("repository") or {})
                         .get("vulnerabilityAlerts",{}))
-                    nodes = va.get("nodes",[])
-                    for n in nodes:
-                        sv = n.get("securityVulnerability") or {}
-                        pkg = sv.get("package") or {}
-                        adv = sv.get("advisory") or {}
-                        out.append({
-                            "dependency": {
-                                "package": {
-                                    "name": (pkg.get("name") or ""),
-                                    "ecosystem": (pkg.get("ecosystem") or "").lower()
-                                },
-                                "manifest_path": n.get("vulnerableManifestPath") or ""
-                            },
-                            "security_advisory": {
-                                "ghsa_id": adv.get("ghsaId") or "",
-                                "identifiers": adv.get("identifiers") or [],
-                                "severity": sv.get("severity") or ""
-                            },
-                            "security_vulnerability": {
-                                "severity": sv.get("severity") or "",
-                                "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
-                                "advisory": {
-                                    "ghsa_id": adv.get("ghsaId") or "",
-                                    "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
-                                    "summary": adv.get("summary") or ""
-                                }
-                            },
-                            "html_url": None,
-                            "state": "open"
-                        })
-                    page = va.get("pageInfo",{})
-                    if not page.get("hasNextPage"):
-                        break
-                    after = json.dumps(page.get("endCursor"))
-                print(f"GraphQL count={len(out)}")
-                return out
+                  nodes = va.get("nodes",[])
+                  for n in nodes:
+                      sv = n.get("securityVulnerability") or {}
+                      pkg = sv.get("package") or {}
+                      adv = sv.get("advisory") or {}
+                      out.append({
+                          "dependency": {
+                              "package": {
+                                  "name": (pkg.get("name") or ""),
+                                  "ecosystem": (pkg.get("ecosystem") or "").lower()
+                              },
+                              "manifest_path": n.get("vulnerableManifestPath") or ""
+                          },
+                          "security_advisory": {
+                              "ghsa_id": adv.get("ghsaId") or "",
+                              "identifiers": adv.get("identifiers") or [],
+                              "severity": sv.get("severity") or ""
+                          },
+                          "security_vulnerability": {
+                              "severity": sv.get("severity") or "",
+                              "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
+                              "advisory": {
+                                  "ghsa_id": adv.get("ghsaId") or "",
+                                  "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
+                                  "summary": adv.get("summary") or ""
+                              }
+                          },
+                          "html_url": None,
+                          "state": "open"
+                      })
+                  page = va.get("pageInfo",{})
+                  if not page.get("hasNextPage"):
+                      break
+                  after = json.dumps(page.get("endCursor"))
+              print(f"GraphQL count={len(out)}")
+              return out
 
-            alerts = try_rest("open")
-            if not alerts:
-                alerts = try_rest("all")
-            if not alerts:
-                alerts = try_graphql()
+          alerts = try_rest("open")
+          if not alerts:
+              alerts = try_rest("all")
+          if not alerts:
+              alerts = try_graphql()
 
-            with open("triage/alerts.json","w",encoding="utf-8") as f:
-                json.dump(alerts, f)
-            print(f"FINAL fetched alerts: {len(alerts)} for {REPO}")
-            PY
-
+          with open("triage/alerts.json","w",encoding="utf-8") as f:
+              json.dump(alerts, f)
+          print(f"FINAL fetched alerts: {len(alerts)} for {REPO}")
+          PY
 
       - name: Classify alerts (used/dev/dedupe incl. Java light)
         shell: bash
@@ -192,46 +191,46 @@ jobs:
           if any(p.glob("**/composer.json")): langs |= {"php"}
           if any(p.glob("**/pom.xml")) or any(p.glob("**/build.gradle*")): langs |= {"java"}
 
-           used_node=set()
-            try:
-                out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
-                if out.returncode==0 and out.stdout.strip():
-                    data = json.loads(out.stdout)
-                    declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
-                    unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
-                    used_node |= (declared - unused)
-            except Exception:
-                pass
+          used_node=set()
+          try:
+              out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
+              if out.returncode==0 and out.stdout.strip():
+                  data = json.loads(out.stdout)
+                  declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
+                  unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
+                  used_node |= (declared - unused)
+          except Exception:
+              pass
 
-            used_py=set()
-            try:
-                out = subprocess.run(["pip-check-unused","--json"], capture_output=True, text=True, timeout=180)
-                if out.returncode==0 and out.stdout.strip():
-                    data = json.loads(out.stdout)
-                    pkgs = data.get("packages") or data.get("dependencies") or []
-                    for p in pkgs:
-                        name = p.get("name") or p.get("package_name") or p.get("package")
-                        if not name:
-                            continue
-                        if p.get("used") or p.get("is_used") or p.get("usage") == "used":
-                            used_py.add(name)
-            except Exception:
-                pass
+          used_py=set()
+          try:
+              out = subprocess.run(["pip-check-unused","--json"], capture_output=True, text=True, timeout=180)
+              if out.returncode==0 and out.stdout.strip():
+                  data = json.loads(out.stdout)
+                  pkgs = data.get("packages") or data.get("dependencies") or []
+                  for pinfo in pkgs:
+                      name = pinfo.get("name") or pinfo.get("package_name") or pinfo.get("package")
+                      if not name:
+                          continue
+                      if pinfo.get("used") or pinfo.get("is_used") or pinfo.get("usage") == "used":
+                          used_py.add(name)
+          except Exception:
+              pass
 
-            used_php=set()
-            try:
-                out = subprocess.run(["composer","unused","--format=json"], capture_output=True, text=True, timeout=180)
-                if out.returncode==0 and out.stdout.strip():
-                    data = json.loads(out.stdout)
-                    unused = set(data.get("unused",[]))
-                    try:
-                        cj = json.load(open("composer.json","r",encoding="utf-8"))
-                        declared = set((cj.get("require") or {}).keys()) | set((cj.get("require-dev") or {}).keys())
-                    except Exception:
-                        declared = set()
-                    used_php = declared - unused
-            except Exception:
-                pass
+          used_php=set()
+          try:
+              out = subprocess.run(["composer","unused","--format=json"], capture_output=True, text=True, timeout=180)
+              if out.returncode==0 and out.stdout.strip():
+                  data = json.loads(out.stdout)
+                  unused = set(data.get("unused",[]))
+                  try:
+                      cj = json.load(open("composer.json","r",encoding="utf-8"))
+                      declared = set((cj.get("require") or {}).keys()) | set((cj.get("require-dev") or {}).keys())
+                  except Exception:
+                      declared = set()
+                  used_php = declared - unused
+          except Exception:
+              pass
 
           def naive_used(pkg:str, eco:str)->bool:
               exts = (".js",".jsx",".ts",".tsx",".py",".php",".java",".kt",".kts",".rb")
@@ -264,7 +263,7 @@ jobs:
                               pass
               return False
 
-          def sev_rank(s): 
+          def sev_rank(s):
               return {"critical":4,"high":3,"moderate":2,"medium":2,"low":1}.get((s or "").lower(),0)
 
           best={}
@@ -312,15 +311,15 @@ jobs:
                   if "test" in mp or "/tests/" in mp or "\\tests\\" in mp:
                       dev=True
 
-            used=False
-            if eco in ("npm","pnpm","yarn") and pkg in used_node:
-                used=True
-            elif eco in ("pip","pypi") and pkg in used_py:
-                used=True
-            elif eco in ("composer",) and pkg in used_php:
-                used=True
-            if not used:
-                used = naive_used(pkg, eco)
+              used=False
+              if eco in ("npm","pnpm","yarn") and pkg in used_node:
+                  used=True
+              elif eco in ("pip","pypi") and pkg in used_py:
+                  used=True
+              elif eco in ("composer",) and pkg in used_php:
+                  used=True
+              if not used:
+                  used = naive_used(pkg, eco)
 
               row = {
                   "package": pkg,
