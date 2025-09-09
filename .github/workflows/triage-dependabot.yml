@@ -50,6 +50,12 @@ jobs:
             echo "-> Java detected (light heuristics, no build)"
           fi
 
+      - name: Who am I & can I see the repo?
+        run: |
+            gh auth status
+            gh api -i repos/${{ env.REPO }} | head -n 20
+
+
       - name: Fetch Dependabot alerts (open → all → GraphQL)
         env:
             REPO: ${{ inputs.repo }}
