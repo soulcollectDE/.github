@@ -1,0 +1,261 @@
+name: Reusable - Dependabot Auto-Triage
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        required: true
+        type: string
+
+jobs:
+  triage:
+    name: Triage ${{ inputs.repo }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ inputs.repo }}
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.REPO }}
+          fetch-depth: 0
+
+      - name: Install scanners (only if needed, recursive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -name package.json | grep -q .; then
+            echo "-> JS/TS detected, installing depcheck"
+            sudo npm i -g depcheck
+          fi
+          if find . -name requirements.txt -o -name pyproject.toml | grep -q .; then
+            echo "-> Python detected, installing vulture + pip-check-unused"
+            python -m pip install --upgrade pip
+            python -m pip install vulture pip-check-unused
+          fi
+          if find . -name composer.json | grep -q .; then
+            echo "-> PHP detected, installing composer (composer-unused optional)"
+            sudo apt-get update -y && sudo apt-get install -y composer
+            composer global require composer-unused/composer-unused --no-interaction || true
+          fi
+          if find . -name pom.xml -o -name build.gradle -o -name build.gradle.kts | grep -q .; then
+            echo "-> Java detected (light heuristics, no build)"
+          fi
+
+      - name: Fetch Dependabot alerts (robust)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p triage
+          set +e
+          gh api -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
+                 repos/${REPO}/dependabot/alerts -F per_page=100 --paginate \
+                 > triage/alerts.json 2> triage/alerts.err
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "Fetch stderr:"
+            cat triage/alerts.err || true
+            if grep -qi "Not Found" triage/alerts.err; then
+              echo "::warning::Dependabot alerts API 404 for ${REPO}. Continuing with empty list."
+              echo "[]" > triage/alerts.json
+            else
+              exit $rc
+            fi
+          fi
+
+      - name: Classify alerts (used/dev/dedupe incl. Java light)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python << 'PY'
+          import os, json, subprocess, re, pathlib
+
+          alerts = json.load(open("triage/alerts.json","r",encoding="utf-8"))
+
+          p = pathlib.Path(".")
+          langs=set()
+          if any(p.glob("**/package.json")): langs |= {"javascript","typescript"}
+          if any(p.glob("**/requirements.txt")) or any(p.glob("**/pyproject.toml")): langs |= {"python"}
+          if any(p.glob("**/composer.json")): langs |= {"php"}
+          if any(p.glob("**/pom.xml")) or any(p.glob("**/build.gradle*")): langs |= {"java"}
+
+          used_node=set()
+          try:
+              out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
+              if out.returncode==0 and out.stdout.strip():
+                  data = json.loads(out.stdout)
+                  declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
+                  unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
+                  used_node |= (declared - unused)
+          except Exception:
+              pass
+
+          def naive_used(pkg:str, eco:str)->bool:
+              exts = (".js",".jsx",".ts",".tsx",".py",".php",".java",".kt",".kts",".rb")
+              pats = [
+                  rf"require\(['\"]{re.escape(pkg)}['\"]\)",
+                  rf"from ['\"]{re.escape(pkg)}['\"]",
+                  rf"import ['\"]{re.escape(pkg)}['\"]",
+                  rf"import .* from ['\"]{re.escape(pkg)}['\"]",
+                  rf"use {re.escape(pkg)}",
+              ]
+              if eco.lower()=="maven":
+                  group, _, artifact = pkg.partition(":")
+                  if group:
+                      pats += [rf"import\s+{re.escape(group)}(\.|;)", rf"@Import\(['\"]{re.escape(group)}"]
+                  if artifact:
+                      artifact_simple = re.sub(r"[-_.]","",artifact)
+                      pats += [rf"{re.escape(artifact)}", rf"{re.escape(artifact_simple)}"]
+              cre = re.compile("|".join(pats))
+              for root, dirs, files in os.walk("."):
+                  r = root.replace("\\","/")
+                  if any(x in r for x in ("/.git","/node_modules","/vendor","/dist","/build","/target",".idea",".gradle")):
+                      continue
+                  for fn in files:
+                      if fn.endswith(exts):
+                          try:
+                              with open(os.path.join(root,fn),"r",encoding="utf-8",errors="ignore") as fh:
+                                  if cre.search(fh.read(2_000_000)):
+                                      return True
+                          except Exception:
+                              pass
+              return False
+
+          def sev_rank(s): 
+              return {"critical":4,"high":3,"moderate":2,"medium":2,"low":1}.get((s or "").lower(),0)
+
+          best={}
+          for a in alerts:
+              dep = a.get("dependency") or {}
+              pkginfo = (dep.get("package") or {}) or ((a.get("security_advisory") or {}).get("package") or {})
+              pkg = pkginfo.get("name") or ""
+              eco = (pkginfo.get("ecosystem") or "").lower()
+              adv = a.get("security_advisory") or {}
+              sev = (adv.get("severity") or a.get("severity") or "")
+              ghsa = adv.get("ghsa_id") or ""
+              cve = ""
+              for id_ in adv.get("identifiers",[]):
+                  if id_.get("type")=="CVE":
+                      cve = id_.get("value") or ""
+                      break
+              key=(eco,pkg,cve or ghsa)
+              r = sev_rank(sev)
+              if key not in best or r>best[key][0]:
+                  best[key]=(r,a)
+
+          kept, ignored = [], []
+          for (_,_,_),(_,a) in best.items():
+              dep = a.get("dependency") or {}
+              pkginfo = (dep.get("package") or {}) or ((a.get("security_advisory") or {}).get("package") or {})
+              pkg = pkginfo.get("name") or ""
+              eco = (pkginfo.get("ecosystem") or "").lower()
+              adv = a.get("security_advisory") or {}
+              sev = (adv.get("severity") or a.get("severity") or "")
+              manifest = dep.get("manifest_path") or ""
+              url = a.get("html_url") or ""
+
+              dev=False
+              if eco in ("npm","pnpm","yarn") and manifest.endswith("package.json"):
+                  try:
+                      pj = json.load(open(manifest,"r",encoding="utf-8"))
+                      if pkg in set((pj.get("devDependencies") or {}).keys()):
+                          dev=True
+                  except Exception:
+                      pass
+              if eco in ("pip","pypi") and ("dev" in manifest.lower() or "test" in manifest.lower()):
+                  dev=True
+              if eco in ("maven","gradle","github-actions-gradle","github-actions-maven"):
+                  mp = manifest.lower()
+                  if "test" in mp or "/tests/" in mp or "\\tests\\" in mp:
+                      dev=True
+
+              used=False
+              if eco in ("npm","pnpm","yarn") and pkg in used_node:
+                  used=True
+              if not used:
+                  used = naive_used(pkg, eco)
+
+              row = {
+                  "package": pkg,
+                  "ecosystem": eco,
+                  "severity": sev,
+                  "manifest": manifest,
+                  "url": url,
+                  "dev": "yes" if dev else "no",
+                  "used": "yes" if used else "no"
+              }
+
+              if not used:
+                  row["reason"]="unused"
+                  ignored.append(row)
+              elif dev and (sev or "").lower() not in ("critical","high"):
+                  row["reason"]="dev-noncritical"
+                  ignored.append(row)
+              else:
+                  kept.append(row)
+
+          pathlib.Path("triage").mkdir(exist_ok=True)
+          json.dump(kept, open("triage/kept.json","w",encoding="utf-8"), indent=2, ensure_ascii=False)
+          json.dump(ignored, open("triage/ignored.json","w",encoding="utf-8"), indent=2, ensure_ascii=False)
+          PY
+
+      - name: Mirror kept alerts to Issues (no dismiss)
+        env:
+          DEST_REPO: ${{ env.REPO }}   # ändere hier auf zentrales Repo, falls Issues im Zielrepo aus sind
+        shell: bash
+        run: |
+          set -euo pipefail
+          python << 'PY'
+          import json, os, subprocess
+
+          dest = os.environ.get("DEST_REPO","")
+          kept = json.load(open("triage/kept.json","r",encoding="utf-8"))
+
+          def sh(*args):
+              return subprocess.run(args, capture_output=True, text=True)
+
+          for r in kept:
+              title = f"[Dependabot Triage] {r.get('ecosystem','')}:{r.get('package','')} ({r.get('severity','')})"
+              scope = "dev" if r.get("dev")=="yes" else "runtime/unknown"
+              body = (
+                  "Automatische Triage – Alert bleibt offen (kein Dismiss).\n\n"
+                  f"- **Repo**: {dest}\n"
+                  f"- **Paket**: `{r.get('package','')}` ({r.get('ecosystem','')})\n"
+                  f"- **Severity**: {r.get('severity','')}\n"
+                  f"- **Scope**: {scope}\n"
+                  f"- **Used**: {r.get('used','')}\n"
+                  f"- **Alert**: {r.get('url','')}\n\n"
+                  "Bitte bewerten, Update/Workaround planen.\n"
+              )
+              labels = ["security","dependabot","needs-triage"]
+              labels.append("dev" if scope=="dev" else "runtime")
+
+              # dedupe by title
+              lst = sh("gh","issue","list","-R",dest,"--search",title,"--json","number,title")
+              try:
+                  existing = [i["title"] for i in json.loads(lst.stdout or "[]")]
+              except Exception:
+                  existing = []
+              if title not in existing:
+                  sh("gh","issue","create","-R",dest,"--title",title,"--body",body,"--label",",".join(labels))
+          PY
+
+      - name: Sanitize artifact name
+        id: sanitize
+        shell: bash
+        run: |
+          SAFE_NAME="$(echo "${REPO}" | tr '/' '-')"
+          echo "safe=${SAFE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload triage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-${{ steps.sanitize.outputs.safe }}
+          path: triage/**
