@@ -184,16 +184,46 @@ jobs:
           if any(p.glob("**/composer.json")): langs |= {"php"}
           if any(p.glob("**/pom.xml")) or any(p.glob("**/build.gradle*")): langs |= {"java"}
 
-          used_node=set()
-          try:
-              out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
-              if out.returncode==0 and out.stdout.strip():
-                  data = json.loads(out.stdout)
-                  declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
-                  unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
-                  used_node |= (declared - unused)
-          except Exception:
-              pass
+           used_node=set()
+            try:
+                out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
+                if out.returncode==0 and out.stdout.strip():
+                    data = json.loads(out.stdout)
+                    declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
+                    unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
+                    used_node |= (declared - unused)
+            except Exception:
+                pass
+
+            used_py=set()
+            try:
+                out = subprocess.run(["pip-check-unused","--json"], capture_output=True, text=True, timeout=180)
+                if out.returncode==0 and out.stdout.strip():
+                    data = json.loads(out.stdout)
+                    pkgs = data.get("packages") or data.get("dependencies") or []
+                    for p in pkgs:
+                        name = p.get("name") or p.get("package_name") or p.get("package")
+                        if not name:
+                            continue
+                        if p.get("used") or p.get("is_used") or p.get("usage") == "used":
+                            used_py.add(name)
+            except Exception:
+                pass
+
+            used_php=set()
+            try:
+                out = subprocess.run(["composer","unused","--format=json"], capture_output=True, text=True, timeout=180)
+                if out.returncode==0 and out.stdout.strip():
+                    data = json.loads(out.stdout)
+                    unused = set(data.get("unused",[]))
+                    try:
+                        cj = json.load(open("composer.json","r",encoding="utf-8"))
+                        declared = set((cj.get("require") or {}).keys()) | set((cj.get("require-dev") or {}).keys())
+                    except Exception:
+                        declared = set()
+                    used_php = declared - unused
+            except Exception:
+                pass
 
           def naive_used(pkg:str, eco:str)->bool:
               exts = (".js",".jsx",".ts",".tsx",".py",".php",".java",".kt",".kts",".rb")
@@ -274,11 +304,15 @@ jobs:
                   if "test" in mp or "/tests/" in mp or "\\tests\\" in mp:
                       dev=True
 
-              used=False
-              if eco in ("npm","pnpm","yarn") and pkg in used_node:
-                  used=True
-              if not used:
-                  used = naive_used(pkg, eco)
+            used=False
+            if eco in ("npm","pnpm","yarn") and pkg in used_node:
+                used=True
+            elif eco in ("pip","pypi") and pkg in used_py:
+                used=True
+            elif eco in ("composer",) and pkg in used_php:
+                used=True
+            if not used:
+                used = naive_used(pkg, eco)
 
               row = {
                   "package": pkg,
