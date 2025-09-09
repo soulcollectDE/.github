@@ -50,110 +50,110 @@ jobs:
 
       - name: Fetch Dependabot alerts (REST + GraphQL Fallback, Python)
         env:
-            REPO: ${{ inputs.repo }}
+          REPO: ${{ inputs.repo }}
         shell: bash
         run: |
-            set -euo pipefail
-            mkdir -p triage
+          set -euo pipefail
+          mkdir -p triage
 
-            python << 'PY'
-            import json, os, subprocess, sys
+          python << 'PY'
+          import json, os, subprocess
 
-            REPO = os.environ["REPO"]
+          REPO = os.environ["REPO"]
 
-            def sh(*args):
-            return subprocess.run(args, capture_output=True, text=True)
+          def sh(*args):
+              return subprocess.run(args, capture_output=True, text=True)
 
-            # 1) REST versuchen
-            rest = sh(
-            "gh","api",
-            "-H","Accept: application/vnd.github+json",
-            "-H","X-GitHub-Api-Version: 2022-11-28",
-            f"/repos/{REPO}/dependabot/alerts",
-            "-F","per_page=100","--paginate"
-            )
-            alerts = []
-            if rest.returncode == 0 and rest.stdout.strip():
-            try:
-                alerts = json.loads(rest.stdout)
-            except Exception:
-                alerts = []
+          alerts = []
 
-            # 2) GraphQL Fallback wenn REST nicht geht
-            if not alerts:
-            q = """
-            query($owner:String!,$name:String!,$after:String){
+          # 1) REST versuchen (mit Query-Params & Pagination)
+          rest = sh(
+              "gh","api",
+              "-H","Accept: application/vnd.github+json",
+              "-H","X-GitHub-Api-Version: 2022-11-28",
+              f"repos/{REPO}/dependabot/alerts?state=open&per_page=100",
+              "--paginate"
+          )
+          if rest.returncode == 0 and rest.stdout.strip():
+              try:
+                  alerts = json.loads(rest.stdout)
+              except Exception:
+                  alerts = []
+
+          # 2) GraphQL Fallback, wenn REST nichts liefert (403/404/leer)
+          if not alerts:
+              q = """
+              query($owner:String!,$name:String!,$after:String){
                 repository(owner:$owner,name:$name){
-                vulnerabilityAlerts(first:100, after:$after){
+                  vulnerabilityAlerts(first:100, after:$after){
                     pageInfo{ hasNextPage endCursor }
                     nodes{
-                    vulnerableManifestPath
-                    securityVulnerability{
+                      vulnerableManifestPath
+                      securityVulnerability{
                         package{ name ecosystem }
                         advisory{ ghsaId summary identifiers{ type value } }
                         severity
                         vulnerableVersionRange
+                      }
                     }
-                    }
+                  }
                 }
-                }
-            }"""
-            owner, name = REPO.split("/",1)
-            after = "null"
-            out = []
-            while True:
-                resp = sh("gh","api","graphql","-f",f"query={q}",
-                        "-F",f"owner={owner}",
-                        "-F",f"name={name}",
-                        "-F",f"after={after}")
-                if resp.returncode != 0:
-                break
-                try:
-                data = json.loads(resp.stdout)
-                nodes = (((data or {}).get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("nodes",[])
-                except Exception:
-                nodes = []
-                for n in nodes:
-                sv = (n.get("securityVulnerability") or {})
-                pkg = (sv.get("package") or {})
-                adv = (sv.get("advisory") or {})
-                # baue REST-ähnliche Struktur
-                alerts.append({
-                    "dependency": {
-                    "package": {
-                        "name": pkg.get("name") or "",
-                        "ecosystem": (pkg.get("ecosystem") or "").lower()
-                    },
-                    "manifest_path": n.get("vulnerableManifestPath") or ""
-                    },
-                    "security_advisory": {
-                    "ghsa_id": adv.get("ghsaId") or "",
-                    "identifiers": adv.get("identifiers") or [],
-                    "severity": sv.get("severity") or ""
-                    },
-                    "security_vulnerability": {
-                    "severity": sv.get("severity") or "",
-                    "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
-                    "advisory": {
-                        "ghsa_id": adv.get("ghsaId") or "",
-                        "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
-                        "summary": adv.get("summary") or ""
-                    }
-                    },
-                    "html_url": None,
-                    "state": "open"
-                })
-                page = (((data or {}).get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("pageInfo",{})
-                if not page.get("hasNextPage"):
-                break
-                # GraphQL cursor muss als JSON-String weitergereicht werden
-                after = json.dumps(page.get("endCursor"))
+              }"""
+              owner, name = REPO.split("/",1)
+              after = "null"
+              while True:
+                  resp = sh("gh","api","graphql","-f",f"query={q}",
+                            "-F",f"owner={owner}",
+                            "-F",f"name={name}",
+                            "-F",f"after={after}")
+                  if resp.returncode != 0:
+                      break
+                  data = {}
+                  try:
+                      data = json.loads(resp.stdout)
+                  except Exception:
+                      data = {}
+                  va = (((data.get("data") or {}).get("repository") or {})
+                        .get("vulnerabilityAlerts",{}))
+                  nodes = va.get("nodes",[])
+                  for n in nodes:
+                      sv = n.get("securityVulnerability") or {}
+                      pkg = sv.get("package") or {}
+                      adv = sv.get("advisory") or {}
+                      alerts.append({
+                          "dependency": {
+                              "package": {
+                                  "name": (pkg.get("name") or ""),
+                                  "ecosystem": (pkg.get("ecosystem") or "").lower()
+                              },
+                              "manifest_path": n.get("vulnerableManifestPath") or ""
+                          },
+                          "security_advisory": {
+                              "ghsa_id": adv.get("ghsaId") or "",
+                              "identifiers": adv.get("identifiers") or [],
+                              "severity": sv.get("severity") or ""
+                          },
+                          "security_vulnerability": {
+                              "severity": sv.get("severity") or "",
+                              "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
+                              "advisory": {
+                                  "ghsa_id": adv.get("ghsaId") or "",
+                                  "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
+                                  "summary": adv.get("summary") or ""
+                              }
+                          },
+                          "html_url": None,
+                          "state": "open"
+                      })
+                  page = va.get("pageInfo",{})
+                  if not page.get("hasNextPage"):
+                      break
+                  after = json.dumps(page.get("endCursor"))
 
-            with open("triage/alerts.json","w",encoding="utf-8") as f:
-            json.dump(alerts, f)
-            print(f"Fetched alerts: {len(alerts)}")
-            PY
-
+          with open("triage/alerts.json","w",encoding="utf-8") as f:
+              json.dump(alerts, f)
+          print(f"Fetched alerts: {len(alerts)}")
+          PY
 
       - name: Classify alerts (used/dev/dedupe incl. Java light)
         shell: bash
@@ -293,7 +293,7 @@ jobs:
 
       - name: Mirror kept alerts to Issues (no dismiss)
         env:
-          DEST_REPO: ${{ env.REPO }}   # ändere hier auf zentrales Repo, falls Issues im Zielrepo aus sind
+          DEST_REPO: ${{ env.REPO }}   # optional: auf zentrales Repo ändern
         shell: bash
         run: |
           set -euo pipefail
