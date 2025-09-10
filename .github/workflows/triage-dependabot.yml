@@ -1,4 +1,4 @@
-name: Reusable - Dependabot Auto-Triage
+name: Reusable - Dependabot Auto-Triage (Improved)
 
 on:
   workflow_call:
@@ -6,9 +6,33 @@ on:
       repo:
         required: true
         type: string
+      fail_on_intersection:
+        description: "Fail when (unused ∩ alerts) not empty"
+        type: boolean
+        default: false
+      min_severity:
+        description: "only triage alerts >= (low|moderate|medium|high|critical)"
+        type: string
+        default: "low"
+      include_node:
+        type: boolean
+        default: true
+      include_python:
+        type: boolean
+        default: true
+      include_composer:
+        type: boolean
+        default: true
+      include_maven:
+        type: boolean
+        default: false   # optional: kann teuer sein
     secrets:
-      security_token:        # optionaler PAT-Fallback (z.B. secrets.SECURITY_READ_TOKEN)
+      security_token:
         required: false
+
+concurrency:
+  group: depauto-${{ inputs.repo }}
+  cancel-in-progress: false
 
 jobs:
   triage:
@@ -18,6 +42,7 @@ jobs:
       contents: read
       security-events: read
       issues: write
+      pull-requests: write
     env:
       REPO: ${{ inputs.repo }}
       GH_TOKEN: ${{ secrets.security_token || github.token }}
@@ -29,330 +54,351 @@ jobs:
           repository: ${{ env.REPO }}
           fetch-depth: 0
 
-      - name: Install scanners (only if needed, recursive)
+      - name: Discover manifests (monorepo aware)
+        id: discover
         shell: bash
         run: |
           set -euo pipefail
-          if find . -name package.json | grep -q .; then
-            echo "-> JS/TS detected, installing depcheck"
-            sudo npm i -g depcheck
+          prune='-path "./.git" -prune -o -path "*/node_modules/*" -prune -o -path "*/vendor/*" -prune -o -path "*/.venv/*" -prune -o -path "*/venv/*" -prune -o -path "*/build/*" -prune -o -path "*/dist/*" -prune -o -path "*/target/*" -prune'
+
+          node_paths="[]"
+          py_paths="[]"
+          comp_paths="[]"
+          maven_paths="[]"
+
+          if ${{ inputs.include_node }}; then
+            node_paths=$(bash -lc "find . $prune -o -name package.json -print | xargs -I{} dirname {} | sort -u | jq -R . | jq -s .")
           fi
-          if find . -name requirements.txt -o -name pyproject.toml | grep -q .; then
-            echo "-> Python detected, installing vulture + pip-check-unused"
-            python -m pip install --upgrade pip
-            python -m pip install vulture pip-check-unused
+          if ${{ inputs.include_python }}; then
+            py_paths=$(bash -lc "find . $prune -o -name requirements.txt -print | xargs -I{} dirname {} | sort -u | jq -R . | jq -s .")
           fi
-          if find . -name composer.json | grep -q .; then
-            echo "-> PHP detected, installing composer (composer-unused optional)"
-            sudo apt-get update -y && sudo apt-get install -y composer
-            composer global require composer-unused/composer-unused --no-interaction || true
+          if ${{ inputs.include_composer }}; then
+            comp_paths=$(bash -lc "find . $prune -o -name composer.json -print | xargs -I{} dirname {} | sort -u | jq -R . | jq -s .")
           fi
-          if find . -name pom.xml -o -name build.gradle -o -name build.gradle.kts | grep -q .; then
-            echo "-> Java detected (light heuristics, no build)"
+          if ${{ inputs.include_maven }}; then
+            maven_paths=$(bash -lc "find . $prune -o -name pom.xml -print | xargs -I{} dirname {} | sort -u | jq -R . | jq -s .")
           fi
+
+          jq -n \
+            --argjson node "$node_paths" \
+            --argjson py "$py_paths" \
+            --argjson comp "$comp_paths" \
+            --argjson maven "$maven_paths" \
+            '{node:$node, python:$py, composer:$comp, maven:$maven}' > manifests.json
+          cat manifests.json
+
+      - name: Build work matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          items=$(jq -c '
+            ([.node[]? | {type:"node", path:.}] // []) +
+            ([.python[]? | {type:"python", path:.}] // []) +
+            ([.composer[]? | {type:"composer", path:.}] // []) +
+            ([.maven[]? | {type:"maven", path:.}] // [])
+          ' manifests.json)
+
+          if [ -z "$items" ] || [ "$(jq 'length' <<<"$items")" -eq 0 ]; then
+            items='[{"type":"none","path":"."}]'
+          fi
+
+          echo "matrix={\"include\":$(echo "$items")}" >> $GITHUB_OUTPUT
+          jq -r <<< "{\"include\": $items}"
+
+      - name: Setup Node (with cache)
+        if: contains(steps.matrix.outputs.matrix, '"type":"node"')
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Python (with cache)
+        if: contains(steps.matrix.outputs.matrix, '"type":"python"')
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            **/requirements.txt
+
+      - name: Setup Composer (optional)
+        if: contains(steps.matrix.outputs.matrix, '"type":"composer"')
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y composer
+
+      - name: Setup Maven (optional)
+        if: contains(steps.matrix.outputs.matrix, '"type":"maven"')
+        uses: stCarolas/setup-maven@v4
+        with:
+          maven-version: '3.9.8'
+
+      - name: Prepare triage dir
+        run: mkdir -p triage/sub && echo > triage/_touch
+
+      - name: Scan subprojects (matrix-like loop)
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -c '.include[]' <<< '${{ steps.matrix.outputs.matrix }}' | nl -ba | while read -r idx line; do
+            type=$(jq -r '.type' <<<"$line")
+            path=$(jq -r '.path' <<<"$line")
+            echo "::group::Scan [$idx] $type @ $path"
+            case "$type" in
+              node)
+                pushd "$path" >/dev/null
+                # install minimal, tolerant
+                if [ -f package-lock.json ]; then npm ci --silent || npm install --silent || true; else npm install --silent || true; fi
+                npx --yes depcheck --json > depcheck.json || echo '{}' > depcheck.json
+                # USED korrekt aus 'using'
+                jq -r '(.using // {}) | keys[]?' depcheck.json | sort -u > ../..//triage/sub/${idx}_node_used.txt || true
+                # UNUSED (für Schnittmenge)
+                jq -r '((.dependencies // []) + (.devDependencies // []))[]?' depcheck.json | sort -u > ../..//triage/sub/${idx}_node_unused.txt || true
+                popd >/dev/null
+                ;;
+              python)
+                pushd "$path" >/dev/null
+                python -m pip install --upgrade pip >/dev/null
+                pip install -r requirements.txt >/dev/null || true
+                pip install pip-check-reqs >/dev/null
+                (pip-extra-reqs . || true) | awk '/^\*/{print $2}' | sed 's/==.*//' | sort -u > ../..//triage/sub/${idx}_py_extra.txt || true
+                popd >/dev/null
+                ;;
+              composer)
+                pushd "$path" >/dev/null
+                composer -n install || true
+                composer global require composer-unused/composer-unused --no-interaction || true
+                composer-unused --format=json > comp_unused.json || echo '{"unused":[]}' > comp_unused.json
+                jq -r '.unused[]?' comp_unused.json | sort -u > ../..//triage/sub/${idx}_comp_unused.txt || true
+                popd >/dev/null
+                ;;
+              maven)
+                pushd "$path" >/dev/null
+                mvn -q -DskipTests dependency:analyze -DfailOnWarning=false || true
+                # Log-Zeilen mit "Unused declared dependencies found:" → Artefakt ableiten
+                # (heuristisch; Maven-Plugin wechselt gelegentlich Format)
+                grep -E "Unused declared dependencies found:" -A9999 target/*/build.log 2>/dev/null \
+                  | awk '/^\[INFO\]/{print $3}' | sed 's/://g' | sort -u > ../..//triage/sub/${idx}_mvn_unused.txt || true
+                popd >/dev/null
+                ;;
+              none)
+                true
+                ;;
+            esac
+            echo "::endgroup::"
+          done
 
       - name: Who am I & can I see the repo?
         run: |
           gh auth status
           gh api -i repos/${{ env.REPO }} | head -n 20 || true
 
-      - name: Fetch Dependabot alerts (open → all → GraphQL)
+      - name: Fetch Dependabot alerts (open→all→GraphQL) with severity filter
         env:
           REPO: ${{ inputs.repo }}
+          MIN_SEV: ${{ inputs.min_severity }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p triage
-
           python << 'PY'
-          import json, os, subprocess
+          import os, json, subprocess
 
           REPO = os.environ["REPO"]
+          MIN = (os.environ.get("MIN_SEV") or "low").lower()
+          rank = {"low":1,"moderate":2,"medium":2,"high":3,"critical":4}
+          min_r = rank.get(MIN,1)
 
-          def sh(*args):
-              return subprocess.run(args, capture_output=True, text=True)
+          def rscore(s): return rank.get((s or "").lower(),0)
+          def sh(*a): return subprocess.run(a, capture_output=True, text=True)
 
           def try_rest(state):
-              print(f"REST try state={state} …")
-              r = sh(
-                  "gh","api",
-                  "-H","Accept: application/vnd.github+json",
-                  "-H","X-GitHub-Api-Version: 2022-11-28",
-                  f"repos/{REPO}/dependabot/alerts?state={state}&per_page=100",
-                  "--paginate"
-              )
-              if r.returncode != 0:
-                  print(f"REST {state} rc={r.returncode}: {r.stderr.strip()}")
-                  return []
-              try:
-                  arr = json.loads(r.stdout or "[]")
-              except Exception:
-                  arr = []
-              print(f"REST {state} count={len(arr)}")
-              return arr
+            r = sh("gh","api","-H","Accept: application/vnd.github+json",
+                   "-H","X-GitHub-Api-Version: 2022-11-28",
+                   f"repos/{REPO}/dependabot/alerts?state={state}&per_page=100","--paginate")
+            if r.returncode!=0: return []
+            try: arr = json.loads(r.stdout or "[]")
+            except: arr=[]
+            return [a for a in arr if rscore(a.get("severity") or (a.get("security_advisory") or {}).get("severity"))>=min_r]
 
           def try_graphql():
-              print("GraphQL fallback …")
-              q = """
-              query($owner:String!,$name:String!,$after:String){
-                repository(owner:$owner,name:$name){
-                  vulnerabilityAlerts(first:100, after:$after){
-                    pageInfo{ hasNextPage endCursor }
-                    nodes{
-                      vulnerableManifestPath
-                      securityVulnerability{
-                        package{ name ecosystem }
-                        advisory{ ghsaId summary identifiers{ type value } }
-                        severity
-                        vulnerableVersionRange
-                      }
+            q = """
+            query($owner:String!,$name:String!,$after:String){
+              repository(owner:$owner,name:$name){
+                vulnerabilityAlerts(first:100, after:$after){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{
+                    vulnerableManifestPath
+                    securityVulnerability{
+                      severity
+                      package{ name ecosystem }
+                      advisory{ ghsaId summary identifiers{ type value } }
+                      vulnerableVersionRange
                     }
                   }
                 }
-              }"""
-              owner, name = REPO.split("/",1)
-              after = "null"
-              out = []
-              while True:
-                  resp = sh("gh","api","graphql","-f",f"query={q}",
-                            "-F",f"owner={owner}",
-                            "-F",f"name={name}",
-                            "-F",f"after={after}")
-                  if resp.returncode != 0:
-                      print(f"GraphQL rc={resp.returncode}: {resp.stderr.strip()}")
-                      break
-                  try:
-                      data = json.loads(resp.stdout)
-                  except Exception:
-                      data = {}
-                  va = (((data.get("data") or {}).get("repository") or {})
-                        .get("vulnerabilityAlerts",{}))
-                  nodes = va.get("nodes",[])
-                  for n in nodes:
-                      sv = n.get("securityVulnerability") or {}
-                      pkg = sv.get("package") or {}
-                      adv = sv.get("advisory") or {}
-                      out.append({
-                          "dependency": {
-                              "package": {
-                                  "name": (pkg.get("name") or ""),
-                                  "ecosystem": (pkg.get("ecosystem") or "").lower()
-                              },
-                              "manifest_path": n.get("vulnerableManifestPath") or ""
-                          },
-                          "security_advisory": {
-                              "ghsa_id": adv.get("ghsaId") or "",
-                              "identifiers": adv.get("identifiers") or [],
-                              "severity": sv.get("severity") or ""
-                          },
-                          "security_vulnerability": {
-                              "severity": sv.get("severity") or "",
-                              "vulnerable_version_range": sv.get("vulnerableVersionRange") or "",
-                              "advisory": {
-                                  "ghsa_id": adv.get("ghsaId") or "",
-                                  "cve_id": next((i.get("value") for i in adv.get("identifiers") or [] if i.get("type")=="CVE"), None),
-                                  "summary": adv.get("summary") or ""
-                              }
-                          },
-                          "html_url": None,
-                          "state": "open"
-                      })
-                  page = va.get("pageInfo",{})
-                  if not page.get("hasNextPage"):
-                      break
-                  after = json.dumps(page.get("endCursor"))
-              print(f"GraphQL count={len(out)}")
-              return out
+              }
+            }"""
+            owner,name = REPO.split("/",1)
+            after="null"; out=[]
+            while True:
+              r = sh("gh","api","graphql","-f",f"query={q}","-F",f"owner={owner}","-F",f"name={name}","-F",f"after={after}")
+              if r.returncode!=0: break
+              data=json.loads(r.stdout)
+              nodes=((data.get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("nodes",[])
+              for n in nodes:
+                sv=n.get("securityVulnerability") or {}
+                sev=sv.get("severity")
+                if rscore(sev)<min_r: continue
+                pkg=(sv.get("package") or {})
+                out.append({
+                  "dependency":{
+                    "package":{"name":pkg.get("name") or "","ecosystem":(pkg.get("ecosystem") or "").lower()},
+                    "manifest_path":n.get("vulnerableManifestPath") or ""
+                  },
+                  "security_advisory":{"ghsa_id":(sv.get("advisory") or {}).get("ghsaId") or "","severity":sev},
+                  "severity":sev,
+                  "state":"open",
+                  "html_url": None
+                })
+              pi=((data.get("data") or {}).get("repository") or {}).get("vulnerabilityAlerts",{}).get("pageInfo",{})
+              if not pi.get("hasNextPage"): break
+              after=json.dumps(pi.get("endCursor"))
+            return out
 
-          alerts = try_rest("open")
-          if not alerts:
-              alerts = try_rest("all")
-          if not alerts:
-              alerts = try_graphql()
+            # end
 
-          with open("triage/alerts.json","w",encoding="utf-8") as f:
-              json.dump(alerts, f)
-          print(f"FINAL fetched alerts: {len(alerts)} for {REPO}")
+          alerts = try_rest("open") or try_rest("all") or try_graphql()
+          with open("triage/alerts.json","w",encoding="utf-8") as f: json.dump(alerts,f)
+          print(f"fetched alerts: {len(alerts)} >= severity {MIN} for {REPO}")
           PY
 
-      - name: Classify alerts (used/dev/dedupe incl. Java light)
+      - name: Classify & intersect (dev/runtime, used/unused)
         shell: bash
         run: |
           set -euo pipefail
           python << 'PY'
-          import os, json, subprocess, re, pathlib
+          import os, json, pathlib, re
 
           alerts = json.load(open("triage/alerts.json","r",encoding="utf-8"))
+          tri = pathlib.Path("triage")
+          sub = tri / "sub"
+          # Aggregate per eco → used/unused sets
+          node_used=set()
+          node_unused=set()
+          py_extra=set()
+          comp_unused=set()
+          mvn_unused=set()
 
-          p = pathlib.Path(".")
-          langs=set()
-          if any(p.glob("**/package.json")): langs |= {"javascript","typescript"}
-          if any(p.glob("**/requirements.txt")) or any(p.glob("**/pyproject.toml")): langs |= {"python"}
-          if any(p.glob("**/composer.json")): langs |= {"php"}
-          if any(p.glob("**/pom.xml")) or any(p.glob("**/build.gradle*")): langs |= {"java"}
+          for p in sub.glob("*_node_used.txt"):
+            node_used |= set(x.strip() for x in p.read_text().splitlines() if x.strip())
+          for p in sub.glob("*_node_unused.txt"):
+            node_unused |= set(x.strip() for x in p.read_text().splitlines() if x.strip())
+          for p in sub.glob("*_py_extra.txt"):
+            py_extra |= set(x.strip() for x in p.read_text().splitlines() if x.strip())
+          for p in sub.glob("*_comp_unused.txt"):
+            comp_unused |= set(x.strip() for x in p.read_text().splitlines() if x.strip())
+          for p in sub.glob("*_mvn_unused.txt"):
+            mvn_unused |= set(x.strip() for x in p.read_text().splitlines() if x.strip())
 
-          used_node=set()
-          try:
-              out = subprocess.run(["depcheck","--json"], capture_output=True, text=True, timeout=180)
-              if out.returncode==0 and out.stdout.strip():
-                  data = json.loads(out.stdout)
-                  declared = set(data.get("dependencies",[])+data.get("devDependencies",[]))
-                  unused = set(data.get("unusedDependencies",[])+data.get("unusedDevDependencies",[]))
-                  used_node |= (declared - unused)
-          except Exception:
-              pass
+          def sev(a):
+            return (a.get("security_advisory") or {}).get("severity") or a.get("severity") or ""
 
-          used_py=set()
-          try:
-              out = subprocess.run(["pip-check-unused","--json"], capture_output=True, text=True, timeout=180)
-              if out.returncode==0 and out.stdout.strip():
-                  data = json.loads(out.stdout)
-                  pkgs = data.get("packages") or data.get("dependencies") or []
-                  for pinfo in pkgs:
-                      name = pinfo.get("name") or pinfo.get("package_name") or pinfo.get("package")
-                      if not name:
-                          continue
-                      if pinfo.get("used") or pinfo.get("is_used") or pinfo.get("usage") == "used":
-                          used_py.add(name)
-          except Exception:
-              pass
+          def is_dev(eco, manifest):
+            m=(manifest or "").lower()
+            if eco in ("npm","pnpm","yarn"):
+              return "test" in m or "examples" in m or m.endswith("package.json") and "dev" in m
+            if eco in ("pip","pypi"):
+              return "test" in m or "dev" in m or "docs" in m
+            if eco in ("composer",):
+              return "test" in m or "dev" in m
+            if eco in ("maven","gradle"):
+              return "test" in m
+            return False
 
-          used_php=set()
-          try:
-              out = subprocess.run(["composer","unused","--format=json"], capture_output=True, text=True, timeout=180)
-              if out.returncode==0 and out.stdout.strip():
-                  data = json.loads(out.stdout)
-                  unused = set(data.get("unused",[]))
-                  try:
-                      cj = json.load(open("composer.json","r",encoding="utf-8"))
-                      declared = set((cj.get("require") or {}).keys()) | set((cj.get("require-dev") or {}).keys())
-                  except Exception:
-                      declared = set()
-                  used_php = declared - unused
-          except Exception:
-              pass
-
-          def naive_used(pkg:str, eco:str)->bool:
-              exts = (".js",".jsx",".ts",".tsx",".py",".php",".java",".kt",".kts",".rb")
-              pats = [
-                  rf"require\(['\"]{re.escape(pkg)}['\"]\)",
-                  rf"from ['\"]{re.escape(pkg)}['\"]",
-                  rf"import ['\"]{re.escape(pkg)}['\"]",
-                  rf"import .* from ['\"]{re.escape(pkg)}['\"]",
-                  rf"use {re.escape(pkg)}",
-              ]
-              if eco.lower()=="maven":
-                  group, _, artifact = pkg.partition(":")
-                  if group:
-                      pats += [rf"import\s+{re.escape(group)}(\.|;)", rf"@Import\(['\"]{re.escape(group)}"]
-                  if artifact:
-                      artifact_simple = re.sub(r"[-_.]","",artifact)
-                      pats += [rf"{re.escape(artifact)}", rf"{re.escape(artifact_simple)}"]
-              cre = re.compile("|".join(pats))
-              for root, dirs, files in os.walk("."):
-                  r = root.replace("\\","/")
-                  if any(x in r for x in ("/.git","/node_modules","/vendor","/dist","/build","/target",".idea",".gradle")):
-                      continue
-                  for fn in files:
-                      if fn.endswith(exts):
-                          try:
-                              with open(os.path.join(root,fn),"r",encoding="utf-8",errors="ignore") as fh:
-                                  if cre.search(fh.read(2_000_000)):
-                                      return True
-                          except Exception:
-                              pass
-              return False
-
-          def sev_rank(s):
-              return {"critical":4,"high":3,"moderate":2,"medium":2,"low":1}.get((s or "").lower(),0)
-
-          best={}
+          kept=[]; ignored=[]
           for a in alerts:
-              dep = a.get("dependency") or {}
-              pkginfo = (dep.get("package") or {}) or ((a.get("security_advisory") or {}).get("package") or {})
-              pkg = pkginfo.get("name") or ""
-              eco = (pkginfo.get("ecosystem") or "").lower()
-              adv = a.get("security_advisory") or {}
-              sev = (adv.get("severity") or a.get("severity") or "")
-              ghsa = adv.get("ghsa_id") or ""
-              cve = ""
-              for id_ in adv.get("identifiers",[]):
-                  if id_.get("type")=="CVE":
-                      cve = id_.get("value") or ""
-                      break
-              key=(eco,pkg,cve or ghsa)
-              r = sev_rank(sev)
-              if key not in best or r>best[key][0]:
-                  best[key]=(r,a)
+            dep = a.get("dependency") or {}
+            pkginfo = dep.get("package") or {}
+            pkg = pkginfo.get("name") or ""
+            eco = (pkginfo.get("ecosystem") or "").lower()
+            manifest = dep.get("manifest_path") or ""
+            used=False
 
-          kept, ignored = [], []
-          for (_,_,_),(_,a) in best.items():
-              dep = a.get("dependency") or {}
-              pkginfo = (dep.get("package") or {}) or ((a.get("security_advisory") or {}).get("package") or {})
-              pkg = pkginfo.get("name") or ""
-              eco = (pkginfo.get("ecosystem") or "").lower()
-              adv = a.get("security_advisory") or {}
-              sev = (adv.get("severity") or a.get("severity") or "")
-              manifest = dep.get("manifest_path") or ""
-              url = a.get("html_url") or ""
+            if eco in ("npm","pnpm","yarn"):
+              used = pkg in node_used
+              unused_hit = (pkg in node_unused)
+            elif eco in ("pip","pypi"):
+              # Wenn in extra-Liste → explizit unbenutzt
+              unused_hit = (pkg in py_extra)
+              used = not unused_hit
+            elif eco in ("composer",):
+              unused_hit = (pkg in comp_unused)
+              used = not unused_hit
+            elif eco in ("maven", "gradle"):
+              unused_hit = (pkg in mvn_unused)  # heuristisch
+              used = not unused_hit
+            else:
+              unused_hit = False
 
-              dev=False
-              if eco in ("npm","pnpm","yarn") and manifest.endswith("package.json"):
-                  try:
-                      pj = json.load(open(manifest,"r",encoding="utf-8"))
-                      if pkg in set((pj.get("devDependencies") or {}).keys()):
-                          dev=True
-                  except Exception:
-                      pass
-              if eco in ("pip","pypi") and ("dev" in manifest.lower() or "test" in manifest.lower()):
-                  dev=True
-              if eco in ("maven","gradle","github-actions-gradle","github-actions-maven"):
-                  mp = manifest.lower()
-                  if "test" in mp or "/tests/" in mp or "\\tests\\" in mp:
-                      dev=True
+            row = {
+              "package": pkg,
+              "ecosystem": eco,
+              "severity": sev(a),
+              "manifest": manifest,
+              "url": a.get("html_url") or "",
+              "dev": "yes" if is_dev(eco, manifest) else "no",
+              "used": "yes" if used else "no"
+            }
 
-              used=False
-              if eco in ("npm","pnpm","yarn") and pkg in used_node:
-                  used=True
-              elif eco in ("pip","pypi") and pkg in used_py:
-                  used=True
-              elif eco in ("composer",) and pkg in used_php:
-                  used=True
-              if not used:
-                  used = naive_used(pkg, eco)
+            if not used or unused_hit:
+              row["reason"]="unused"
+              ignored.append(row)
+            elif row["dev"]=="yes" and row["severity"].lower() not in ("critical","high"):
+              row["reason"]="dev-noncritical"
+              ignored.append(row)
+            else:
+              kept.append(row)
 
-              row = {
-                  "package": pkg,
-                  "ecosystem": eco,
-                  "severity": sev,
-                  "manifest": manifest,
-                  "url": url,
-                  "dev": "yes" if dev else "no",
-                  "used": "yes" if used else "no"
-              }
-
-              if not used:
-                  row["reason"]="unused"
-                  ignored.append(row)
-              elif dev and (sev or "").lower() not in ("critical","high"):
-                  row["reason"]="dev-noncritical"
-                  ignored.append(row)
-              else:
-                  kept.append(row)
-
-          pathlib.Path("triage").mkdir(exist_ok=True)
-          json.dump(kept, open("triage/kept.json","w",encoding="utf-8"), indent=2, ensure_ascii=False)
-          json.dump(ignored, open("triage/ignored.json","w",encoding="utf-8"), indent=2, ensure_ascii=False)
+          (tri / "kept.json").write_text(json.dumps(kept, indent=2, ensure_ascii=False), encoding="utf-8")
+          (tri / "ignored.json").write_text(json.dumps(ignored, indent=2, ensure_ascii=False), encoding="utf-8")
           PY
 
-      - name: Mirror kept alerts to Issues (no dismiss)
+      - name: Build report
+        id: report
+        shell: bash
+        run: |
+          set -euo pipefail
+          kept_n=$(jq 'length' triage/kept.json 2>/dev/null || echo 0)
+          ign_n=$(jq 'length' triage/ignored.json 2>/dev/null || echo 0)
+
+          {
+            echo "### Dependabot Auto-Triage – ${REPO}"
+            echo
+            echo "**Alerts (gefiltert nach min_severity=${{ inputs.min_severity }}):** kept=${kept_n}, ignored=${ign_n}"
+            echo
+            echo "#### ⚠️ Kandidaten zum Entfernen (unused ∩ alerts / dev-noncritical)"
+            jq -r '.[] | "- `\(.ecosystem):\(.package)` (sev: \(.severity), dev: \(.dev), used: \(.used)) \(.manifest)"' triage/ignored.json || true
+            echo
+            echo "#### ✅ Relevante Alerts (bleiben offen)"
+            jq -r '.[] | "- `\(.ecosystem):\(.package)` (sev: \(.severity), dev: \(.dev), used: \(.used)) \(.manifest)"' triage/kept.json || true
+          } | tee triage/report.md
+
+      - name: Comment to PR (if PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          filePath: triage/report.md
+
+      - name: Mirror kept alerts to Issues (dedup)
         env:
-          DEST_REPO: ${{ env.REPO }}   # optional: auf zentrales Repo ändern
+          DEST_REPO: ${{ env.REPO }}
         shell: bash
         run: |
           set -euo pipefail
           python << 'PY'
-          import json, os, subprocess
+          import json, os, subprocess, hashlib
 
           dest = os.environ.get("DEST_REPO","")
           kept = json.load(open("triage/kept.json","r",encoding="utf-8"))
@@ -361,7 +407,9 @@ jobs:
               return subprocess.run(args, capture_output=True, text=True)
 
           for r in kept:
-              title = f"[Dependabot Triage] {r.get('ecosystem','')}:{r.get('package','')} ({r.get('severity','')})"
+              key = f"{dest}|{r.get('ecosystem')}|{r.get('package')}|{r.get('severity')}|{r.get('manifest')}"
+              slug = hashlib.sha1(key.encode()).hexdigest()[:10]
+              title = f"[Dependabot Triage] {r.get('ecosystem')}:{r.get('package')} ({r.get('severity')}) [{slug}]"
               scope = "dev" if r.get("dev")=="yes" else "runtime/unknown"
               body = (
                   "Automatische Triage – Alert bleibt offen (kein Dismiss).\n\n"
@@ -370,8 +418,8 @@ jobs:
                   f"- **Severity**: {r.get('severity','')}\n"
                   f"- **Scope**: {scope}\n"
                   f"- **Used**: {r.get('used','')}\n"
-                  f"- **Alert**: {r.get('url','')}\n\n"
-                  "Bitte bewerten, Update/Workaround planen.\n"
+                  f"- **Manifest**: {r.get('manifest','')}\n"
+                  f"- **Alert**: {r.get('url','')}\n"
               )
               labels = ["security","dependabot","needs-triage"]
               labels.append("dev" if scope=="dev" else "runtime")
@@ -397,3 +445,15 @@ jobs:
         with:
           name: triage-${{ steps.sanitize.outputs.safe }}
           path: triage/**
+
+      - name: Fail on intersections (policy)
+        if: ${{ inputs.fail_on_intersection == true }}
+        shell: bash
+        run: |
+          # Fail, wenn es überhaupt ignorierte (unused/dev-noncritical) Alerts gibt
+          cnt=$(jq 'length' triage/ignored.json 2>/dev/null || echo 0)
+          if [ "$cnt" -gt 0 ]; then
+            echo "Unused/dev-noncritical Alerts vorhanden ($cnt). Policy verlangt Fail."
+            exit 1
+          fi
+
